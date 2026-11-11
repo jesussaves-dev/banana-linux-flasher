@@ -91,7 +91,7 @@ def _hidden_run(cmd: list[str], timeout: int = 60, encoding: str = "utf-8",
 #  Application / release constants
 # ---------------------------------------------------------------------------
 APP_NAME = "BananaLinux Flasher"
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.4"
 
 GITHUB_REPO = "JorreFog/BananaLinux"
 RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
