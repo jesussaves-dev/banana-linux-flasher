@@ -57,6 +57,36 @@ IS_LINUX = sys.platform.startswith("linux")
 
 DEVNULL = subprocess.DEVNULL
 
+# Windows: console tools (powershell, diskpart, mountvol) launched from a
+# windowed (--noconsole) build would each flash a black console window. That
+# looks alarming to users and "hidden console child processes" is a classic
+# antivirus heuristic, so every such child is started with CREATE_NO_WINDOW.
+CREATE_NO_WINDOW = 0x08000000
+
+
+def _hidden_run(cmd: list[str], timeout: int = 60, encoding: str = "utf-8",
+                merge_stderr: bool = False) -> subprocess.CompletedProcess:
+    """
+    Run a console tool without a window, stdin closed, output decoded leniently.
+
+    A windowed PyInstaller build has no valid stdio handles, so stdin is always
+    redirected. Output is decoded with ``errors="replace"`` so a localised
+    Windows (non-ASCII drive models, OEM code pages) can never crash parsing.
+    """
+    kwargs: dict = {}
+    if IS_WINDOWS:
+        kwargs["creationflags"] = CREATE_NO_WINDOW
+    proc = subprocess.run(
+        cmd,
+        stdin=DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT if merge_stderr else DEVNULL,
+        timeout=timeout,
+        **kwargs,
+    )
+    proc.stdout = (proc.stdout or b"").decode(encoding, errors="replace")
+    return proc
+
 # ---------------------------------------------------------------------------
 #  Application / release constants
 # ---------------------------------------------------------------------------
@@ -78,6 +108,10 @@ MODELS = {
 DEFAULT_MODEL = "Anbernic RG DS Plus"
 
 CHUNK_SIZE = 1 << 20          # 1 MiB streaming granularity
+# Raw \\.\PhysicalDriveN writes must be whole sectors; Windows rejects a
+# ragged final write with ERROR_INVALID_PARAMETER (87). 4096 covers both 512e
+# and 4Kn media, and the disk was wiped first so the zero tail is harmless.
+WIN_SECTOR_ALIGN = 4096
 ZERO_WIPE_BYTES = 10 * 1024 * 1024   # "first 10MB" zeroing on Linux
 
 # ---------------------------------------------------------------------------
@@ -719,12 +753,7 @@ def _windows_system_disk_number() -> int | None:
         "$d.DiskNumber"
     )
     try:
-        out = subprocess.check_output(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-            text=True,
-            stderr=DEVNULL,
-            timeout=30,
-        ).strip()
+        out = _powershell(script, timeout=30).stdout.strip()
         return int(out.splitlines()[0])
     except Exception:
         return 0  # Conservative fallback: disk 0 is almost always the OS disk.
@@ -741,12 +770,7 @@ def _list_devices_windows() -> list[dict]:
     )
     records: list[dict] = []
     try:
-        out = subprocess.check_output(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-            text=True,
-            stderr=DEVNULL,
-            timeout=45,
-        ).strip()
+        out = _powershell(script, timeout=45).stdout.strip()
         if out:
             parsed = json.loads(out)
             records = parsed if isinstance(parsed, list) else [parsed]
@@ -901,12 +925,12 @@ def _wipe_windows(device: dict, log) -> None:
         with os.fdopen(handle, "w") as fh:
             fh.write(script)
         try:
-            proc = subprocess.run(
+            # diskpart prints in the console's OEM code page.
+            proc = _hidden_run(
                 ["diskpart", "/s", path],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
                 timeout=300,
+                encoding="oem" if IS_WINDOWS else "utf-8",
+                merge_stderr=True,
             )
         except subprocess.TimeoutExpired as exc:
             raise FlasherError("diskpart timed out while cleaning the disk.") from exc
@@ -934,12 +958,11 @@ SHELL_HW_SERVICE = "ShellHWDetection"
 
 
 def _powershell(script: str, timeout: int = 60) -> subprocess.CompletedProcess:
-    """Run a PowerShell snippet, capturing stdout and discarding stderr."""
-    return subprocess.run(
-        ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
+    """Run a PowerShell snippet (hidden window), returning UTF-8 decoded stdout."""
+    script = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; " + script
+    return _hidden_run(
+        ["powershell", "-NoLogo", "-NoProfile", "-NonInteractive",
+         "-Command", script],
         timeout=timeout,
     )
 
@@ -980,12 +1003,7 @@ def _automount_enabled() -> bool:
 def _set_automount(enabled: bool) -> bool:
     """Enable ('/E') or disable ('/N') automatic mounting of new volumes."""
     try:
-        proc = subprocess.run(
-            ["mountvol", "/E" if enabled else "/N"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=60,
-        )
+        proc = _hidden_run(["mountvol", "/E" if enabled else "/N"], timeout=60)
         return proc.returncode == 0
     except Exception:
         return False
@@ -1416,6 +1434,10 @@ def _flash_windows(image_path, device, total, progress, cancel, log) -> int:
 
         def write_chunk(chunk: bytes) -> None:
             nonlocal offset, retries_remaining
+            ragged = len(chunk) % WIN_SECTOR_ALIGN
+            if ragged:
+                # Only the image's final chunk can be ragged; zero-pad it.
+                chunk = bytes(chunk) + b"\0" * (WIN_SECTOR_ALIGN - ragged)
             view = memoryview(chunk)
             while view:
                 position = ctypes.c_longlong(offset)
@@ -1488,6 +1510,35 @@ def _flash_windows(image_path, device, total, progress, cancel, log) -> int:
 # downloaded image path and the target drive index.
 PRIVILEGED_WRITE_FLAG = "--privileged-write"
 ERROR_CANCELLED = 1223  # UAC prompt dismissed
+# How long Cancel waits for the helper to stop by itself (restoring automount
+# and Shell Hardware Detection) before it is forcibly terminated.
+HELPER_CANCEL_GRACE_S = 20.0
+
+
+def _request_cancel(cancel_path: str | None) -> None:
+    """Ask the elevated helper to stop by creating its cancel marker file."""
+    if not cancel_path:
+        return
+    try:
+        with open(cancel_path, "w", encoding="utf-8") as handle:
+            handle.write("cancel\n")
+    except OSError:
+        pass
+
+
+def _watch_cancel_file(cancel_path: str, cancel_event: threading.Event,
+                       interval: float = 0.25) -> threading.Thread:
+    """Set `cancel_event` once `cancel_path` appears (helper side)."""
+    def watch() -> None:
+        while not cancel_event.is_set():
+            if os.path.exists(cancel_path):
+                cancel_event.set()
+                return
+            time.sleep(interval)
+
+    thread = threading.Thread(target=watch, name="cancel-watch", daemon=True)
+    thread.start()
+    return thread
 
 
 def _stderr(message: str) -> None:
@@ -1584,6 +1635,9 @@ def _privileged_write_main(request_path: str) -> int:
     log_path = request.get("log_file")
     result_path = request.get("result_file")
     cancel_event = threading.Event()
+    cancel_path = request.get("cancel_file")
+    if cancel_path:
+        _watch_cancel_file(cancel_path, cancel_event)
 
     def emit(payload: dict) -> None:
         if status_path:
@@ -1663,7 +1717,8 @@ def _privileged_write_main(request_path: str) -> int:
 
 def _spawn_elevated_write(request_path: str, status_path: str,
                           result_path: str, progress, status_cb, log,
-                          cancel: threading.Event) -> int:
+                          cancel: threading.Event,
+                          cancel_path: str | None = None) -> int:
     """
     Launch the privileged helper via UAC and relay its progress.
 
@@ -1735,10 +1790,19 @@ def _spawn_elevated_write(request_path: str, status_path: str,
 
     process = info.hProcess
     offset = 0
+    cancel_deadline: float | None = None
     try:
         while True:
-            if cancel.is_set():
-                kernel32.TerminateProcess(process, 1)
+            if cancel.is_set() and cancel_deadline is None:
+                # Ask the helper to stop cleanly so it restores automount and
+                # Shell Hardware Detection; only kill it if it does not comply.
+                _request_cancel(cancel_path)
+                cancel_deadline = time.monotonic() + (
+                    HELPER_CANCEL_GRACE_S if cancel_path else 0.0)
+            if cancel_deadline is not None and time.monotonic() >= cancel_deadline:
+                if not kernel32.TerminateProcess(process, 1):
+                    log("  (could not terminate the elevated helper; it will "
+                        "stop on its own)")
                 raise Cancelled()
             offset = _read_status_updates(
                 status_path, offset,
@@ -1757,6 +1821,8 @@ def _spawn_elevated_write(request_path: str, status_path: str,
         kernel32.CloseHandle(process)
 
     result = _read_worker_result(result_path)
+    if result.get("cancelled") or (cancel.is_set() and not result.get("ok")):
+        raise Cancelled()
     if not result.get("ok"):
         raise FlasherError(result.get("error") or "The elevated helper failed.")
     return int(result.get("written") or 0)
@@ -1778,7 +1844,15 @@ class FlashWorker(threading.Thread):
         self.release = release
         self.keep_image = keep_image
         self.cancel_event = threading.Event()
+        self._cancel_path: str | None = None
         self._emit = app.emit
+
+    def cancel(self) -> None:
+        """Stop the pipeline, including an elevated helper if one is running."""
+        self.cancel_event.set()
+        # Written synchronously so it still reaches the helper when the GUI is
+        # closing and this daemon thread is about to be torn down.
+        _request_cancel(self._cancel_path)
 
     # -- reporting helpers -------------------------------------------------
     def log(self, message: str) -> None:
@@ -1927,12 +2001,14 @@ class FlashWorker(threading.Thread):
         request_path = os.path.join(self._workdir, "request.json")
         status_path = os.path.join(self._workdir, "status.ndjson")
         result_path = os.path.join(self._workdir, "result.json")
+        self._cancel_path = os.path.join(self._workdir, "cancel")
         request = {
             "image": image_path,
             "device": self.device,
             "total": total,
             "status_file": status_path,
             "result_file": result_path,
+            "cancel_file": self._cancel_path,
             "log_file": os.path.join(self._workdir, "worker.log"),
         }
         with open(request_path, "w", encoding="utf-8") as handle:
@@ -1946,6 +2022,7 @@ class FlashWorker(threading.Thread):
         written = _spawn_elevated_write(
             request_path, status_path, result_path,
             self._flash_progress, self.status, self.log, self.cancel_event,
+            cancel_path=self._cancel_path,
         )
         return written, time.monotonic() - start
 
@@ -2571,7 +2648,7 @@ class BananaFlasherApp(tk.Tk):
 
     def cancel_flash(self) -> None:
         if self.worker and self.worker.is_alive():
-            self.worker.cancel_event.set()
+            self.worker.cancel()
             self.status_var.set("Cancelling ...")
             self.log("Cancel requested; stopping after the current block ...")
 
@@ -2688,7 +2765,7 @@ class BananaFlasherApp(tk.Tk):
                 icon="warning",
             ):
                 return
-            self.worker.cancel_event.set()
+            self.worker.cancel()
 
         self._closing = True
         self.privileges.shutdown()

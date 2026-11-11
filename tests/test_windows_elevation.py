@@ -262,7 +262,7 @@ class SpawnElevatedWriteTests(unittest.TestCase):
         with open(self.request, "w", encoding="utf-8") as handle:
             json.dump({"device": DEVICE}, handle)
 
-    def _run(self, shell, kernel, cancel=None, last_error=0):
+    def _run(self, shell, kernel, cancel=None, last_error=0, cancel_path=None):
         progress, status, log = [], [], []
         patchers = [
             mock.patch.object(ctypes, "WinDLL", create=True,
@@ -277,7 +277,7 @@ class SpawnElevatedWriteTests(unittest.TestCase):
         written = fb._spawn_elevated_write(
             self.request, self.status, self.result,
             lambda *a: progress.append(a), status.append, log.append,
-            cancel or threading.Event())
+            cancel or threading.Event(), cancel_path=cancel_path)
         return written, progress, status, log
 
     def test_success_relays_progress_and_returns_written(self):
@@ -317,6 +317,38 @@ class SpawnElevatedWriteTests(unittest.TestCase):
         with self.assertRaises(fb.Cancelled):
             self._run(FakeShell32(), kernel, cancel=cancel)
         self.assertEqual(kernel.terminated, [4242])
+
+    def test_cancel_asks_helper_to_stop_cleanly(self):
+        kernel = FakeKernel32()  # helper exits as soon as it is asked
+        cancel = threading.Event()
+        cancel.set()
+        cancel_path = os.path.join(self._tmp.name, "cancel")
+        with open(self.result, "w", encoding="utf-8") as handle:
+            json.dump({"ok": False, "cancelled": True}, handle)
+        with self.assertRaises(fb.Cancelled):
+            self._run(FakeShell32(), kernel, cancel=cancel,
+                      cancel_path=cancel_path)
+        self.assertTrue(os.path.exists(cancel_path))
+        self.assertEqual(kernel.terminated, [])
+
+    def test_unresponsive_helper_is_terminated_after_grace(self):
+        kernel = FakeKernel32()
+        kernel.WaitForSingleObject = lambda _h, _ms: 0x102  # WAIT_TIMEOUT
+        cancel = threading.Event()
+        cancel.set()
+        with mock.patch.object(fb, "HELPER_CANCEL_GRACE_S", 0.0):
+            with self.assertRaises(fb.Cancelled):
+                self._run(FakeShell32(), kernel, cancel=cancel,
+                          cancel_path=os.path.join(self._tmp.name, "cancel"))
+        self.assertEqual(kernel.terminated, [4242])
+
+    def test_helper_watches_cancel_file(self):
+        cancel_path = os.path.join(self._tmp.name, "cancel")
+        event = threading.Event()
+        fb._watch_cancel_file(cancel_path, event, interval=0.01)
+        self.assertFalse(event.wait(0.05))
+        fb._request_cancel(cancel_path)
+        self.assertTrue(event.wait(2))
 
 
 # ---------------------------------------------------------------------------

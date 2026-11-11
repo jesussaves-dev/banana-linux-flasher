@@ -35,6 +35,15 @@ you by [GitHub Actions](.github/workflows/build-exe.yml) on every `v*` tag.
 
 > Windows may show a SmartScreen notice for this unsigned community build.
 > Choose **More info → Run anyway**.
+>
+> **Antivirus warnings:** some engines (including Windows Defender) flag
+> unsigned PyInstaller apps as `Trojan:Win32/Wacatac` or similar. This is a
+> false positive caused by the packer, not the app. Releases are built without
+> UPX and with a source-compiled bootloader to minimise this, and every release
+> ships a `BananaLinuxFlasher.exe.sha256` so you can confirm your download
+> (`Get-FileHash BananaLinuxFlasher.exe`) matches what CI built. If it is still
+> quarantined, restore it from **Windows Security → Protection history**, or
+> run from source (below).
 
 ## ⬇️ Download for Linux (AppImage)
 
@@ -291,8 +300,10 @@ it:
    `result.json`.
 5. The GUI polls the status file on the background thread, relaying progress to
    the Tk progress bar and log, and waits on the helper's process handle. A
-   dismissed UAC prompt, a helper failure, or Cancel (which terminates the
-   helper) are all surfaced cleanly.
+   dismissed UAC prompt, a helper failure, or Cancel are all surfaced cleanly.
+   Cancel drops a `cancel` marker file the helper watches, so it stops after
+   the current block and restores automount / Shell Hardware Detection; it is
+   only force-terminated if it does not exit within 20 seconds.
 
 The hand-off uses files inside a per-user temp directory rather than an
 inherited pipe, which keeps the worker independent of the parent's stdio
@@ -315,6 +326,8 @@ cannot be pointed at the system disk.
 | Windows: *"Administrator rights are required … UAC prompt was dismissed"* | You declined the elevation prompt. Press **Download & Flash** again and choose **Yes** on the UAC dialog. |
 | Windows: *"Could not start the elevated helper"* | The UAC elevation failed (group policy, disabled UAC, or a locked-down account). Try running the app from an Administrator account. |
 | Windows: SmartScreen blocks the `.exe` | The release is unsigned. Choose **More info → Run anyway**, or run from source. |
+| Windows: Defender / antivirus deletes or quarantines the `.exe` | False positive on the unsigned PyInstaller packer. Compare the file's SHA-256 with the release's `.exe.sha256`, then restore it from **Windows Security → Protection history → Allow**. You can also report it at <https://www.microsoft.com/wdsi/filesubmission> as a false positive. |
+| Windows: write fails with *Windows error 87* at the very end | Fixed: the final partial chunk is now padded to a whole sector, which raw disk writes require. |
 | Linux: AppImage won't start (*"Permission denied"*) | Make it executable first: `chmod +x BananaLinuxFlasher-*.AppImage`. |
 | Linux: AppImage fails to mount (*FUSE* / *"dlopen"* error) | Run it without FUSE: `./BananaLinuxFlasher-*.AppImage --appimage-extract-and-run`. |
 | Linux: *"Required tool not found: wipefs"* | Install `util-linux` (`sudo apt install util-linux`, `sudo dnf install util-linux`, …); `dd` ships with coreutils. |

@@ -156,6 +156,16 @@ class FlashWindowsWriteTests(unittest.TestCase):
         self.assertEqual(bytes(state.ba), self.content)
         self.assertEqual(state.seeks[0], 0)
 
+    def test_ragged_final_chunk_is_padded_to_sector(self):
+        self.content = self.content + b"tail!"  # not a 4096 multiple
+        self.image = _make_image(self._tmp.name, self.content)
+        state = FakeDiskState()
+        written = self._run(state)
+        self.assertEqual(written, len(self.content))
+        self.assertEqual(len(state.ba) % fb.WIN_SECTOR_ALIGN, 0)
+        self.assertEqual(bytes(state.ba[:len(self.content)]), self.content)
+        self.assertEqual(state.ba[len(self.content):].strip(b"\0"), b"")
+
     def test_short_write_is_completed_at_correct_offset(self):
         state = FakeDiskState(short_write_first=True)
         self._run(state)
