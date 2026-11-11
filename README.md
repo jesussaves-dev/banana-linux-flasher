@@ -1,8 +1,8 @@
 # 🍌 BananaLinux Flasher
 
-[![Build Windows Executable](https://github.com/jesussaves-ai/banana-linux-flasher/actions/workflows/build-exe.yml/badge.svg)](https://github.com/jesussaves-ai/banana-linux-flasher/actions/workflows/build-exe.yml)
-[![Build Linux AppImage](https://github.com/jesussaves-ai/banana-linux-flasher/actions/workflows/build-appimage.yml/badge.svg)](https://github.com/jesussaves-ai/banana-linux-flasher/actions/workflows/build-appimage.yml)
-[![Tests](https://github.com/jesussaves-ai/banana-linux-flasher/actions/workflows/tests.yml/badge.svg)](https://github.com/jesussaves-ai/banana-linux-flasher/actions/workflows/tests.yml)
+[![Build Windows Executable](https://github.com/jesussaves-dev/banana-linux-flasher/actions/workflows/build-exe.yml/badge.svg)](https://github.com/jesussaves-dev/banana-linux-flasher/actions/workflows/build-exe.yml)
+[![Build Linux AppImage](https://github.com/jesussaves-dev/banana-linux-flasher/actions/workflows/build-appimage.yml/badge.svg)](https://github.com/jesussaves-dev/banana-linux-flasher/actions/workflows/build-appimage.yml)
+[![Tests](https://github.com/jesussaves-dev/banana-linux-flasher/actions/workflows/tests.yml/badge.svg)](https://github.com/jesussaves-dev/banana-linux-flasher/actions/workflows/tests.yml)
 
 A small, dependency-free, cross-platform desktop app for flashing
 [BananaLinux](https://github.com/JorreFog/BananaLinux) to a microSD card for the
@@ -19,7 +19,7 @@ device. No BalenaEtcher, no Rufus, no extra tooling.
 ## ⬇️ Download for Windows (recommended)
 
 **No Python required.** Grab the standalone `BananaLinuxFlasher.exe` from the
-[latest GitHub Release](https://github.com/jesussaves-ai/banana-linux-flasher/releases/latest):
+[latest GitHub Release](https://github.com/jesussaves-dev/banana-linux-flasher/releases/latest):
 
 1. Open the **Assets** section and download **`BananaLinuxFlasher.exe`**.
 2. Double-click it to run — **you do not need to run the whole app as
@@ -48,7 +48,7 @@ you by [GitHub Actions](.github/workflows/build-exe.yml) on every `v*` tag.
 ## ⬇️ Download for Linux (AppImage)
 
 **No Python required.** Grab `BananaLinuxFlasher-<version>-x86_64.AppImage`
-from the [latest GitHub Release](https://github.com/jesussaves-ai/banana-linux-flasher/releases/latest):
+from the [latest GitHub Release](https://github.com/jesussaves-dev/banana-linux-flasher/releases/latest):
 
 ```bash
 chmod +x BananaLinuxFlasher-*-x86_64.AppImage
@@ -171,7 +171,7 @@ device — nothing is ever written to an intermediate uncompressed file:
 ### Setup and running
 
 ```bash
-git clone https://github.com/jesussaves-ai/banana-linux-flasher.git
+git clone https://github.com/jesussaves-dev/banana-linux-flasher.git
 cd banana-linux-flasher
 ```
 
