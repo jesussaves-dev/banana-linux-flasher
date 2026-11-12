@@ -5,8 +5,8 @@
 [![Tests](https://github.com/jesussaves-dev/banana-linux-flasher/actions/workflows/tests.yml/badge.svg)](https://github.com/jesussaves-dev/banana-linux-flasher/actions/workflows/tests.yml)
 
 A small, dependency-free, cross-platform desktop app for flashing
-[BananaLinux](https://github.com/JorreFog/BananaLinux) to a microSD card for the
-**Anbernic RG DS** and **Anbernic RG DS Plus**.
+[BananaLinux](https://github.com/JorreFog/BananaLinux) and [Banana-Pocket](https://github.com/jesussaves-dev/Banana-Pocket) to a microSD card for the
+**Anbernic RG DS**, **Anbernic RG DS Plus**, and **Retroid Pocket Classic**.
 
 It downloads the newest release straight from GitHub, safely wipes the card's
 partition table, and streams the decompressed disk image directly to the raw
@@ -96,11 +96,12 @@ which are present on virtually every desktop distro. It is built by
 **Dynamic GitHub release integration**
 
 * Resolves the latest release and the correct asset for the selected model:
-  * `banana-rgds-plus.img.gz` → Anbernic RG DS Plus
-  * `banana-rgds.img.gz` → Anbernic RG DS
+  * `banana-rgds-plus.img.gz` → Anbernic RG DS Plus ([JorreFog/BananaLinux](https://github.com/JorreFog/BananaLinux))
+  * `banana-rgds.img.gz` → Anbernic RG DS ([JorreFog/BananaLinux](https://github.com/JorreFog/BananaLinux))
+  * `banana-retroid-pocket-classic.img.gz` → Retroid Pocket Classic ([jesussaves-dev/Banana-Pocket](https://github.com/jesussaves-dev/Banana-Pocket))
 * Queries `…/releases/latest` first, then falls back to the release list
   (newest non-draft first) so it keeps working for **pre-release-only** repos —
-  which is currently the case for BananaLinux upstream.
+  which is currently the case for upstream Banana repos.
 * Shows the resolved asset, release tag and download size before you commit.
 * Streams the download with a progress bar and truncation detection.
 
@@ -341,8 +342,8 @@ cannot be pointed at the system disk.
 
 * Writing an image **permanently destroys** everything already on the card.
   Double-check the selected device.
-* This tool is unaffiliated with Anbernic. BananaLinux is a separate community
-  project; upstream releases are currently published as pre-releases.
+* This tool is unaffiliated with Anbernic or Retroid. BananaLinux and BananaOS are
+  separate community projects; upstream releases are currently published as pre-releases.
 * Windows and macOS code paths are implemented against the documented system APIs
   but are best verified on the real OS before trusting them with a card.
 

@@ -6,8 +6,9 @@ BananaLinux Flasher
 
 A minimalist, cross-platform (Linux / Windows / macOS) GUI utility that:
 
-  1. Dynamically resolves the newest BananaLinux release on GitHub and picks the
-     correct image asset for the selected Anbernic handheld.
+  1. Dynamically resolves the newest release on GitHub and picks the
+     correct image asset for the selected handheld (Anbernic RG DS,
+     Anbernic RG DS Plus, or Retroid Pocket Classic).
   2. Enumerates physical microSD drives, always filtering out the drive the
      host operating system is running from.
   3. Securely wipes the partition table / boot area of the target (wipefs + dd
@@ -91,9 +92,10 @@ def _hidden_run(cmd: list[str], timeout: int = 60, encoding: str = "utf-8",
 #  Application / release constants
 # ---------------------------------------------------------------------------
 APP_NAME = "BananaLinux Flasher"
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.0.5"
 
-GITHUB_REPO = "JorreFog/BananaLinux"
+DEFAULT_REPO = "JorreFog/BananaLinux"
+GITHUB_REPO = DEFAULT_REPO
 RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 RELEASES_LIST_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases"
 RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases/latest"
@@ -104,8 +106,30 @@ USER_AGENT = f"{APP_NAME}/{APP_VERSION} (+https://github.com/{GITHUB_REPO})"
 MODELS = {
     "Anbernic RG DS Plus": "banana-rgds-plus.img.gz",
     "Anbernic RG DS": "banana-rgds.img.gz",
+    "Retroid Pocket Classic": "banana-retroid-pocket-classic.img.gz",
 }
+
+# Friendly model name -> GitHub repository (owner/repo)
+MODEL_REPOS = {
+    "Anbernic RG DS Plus": "JorreFog/BananaLinux",
+    "Anbernic RG DS": "JorreFog/BananaLinux",
+    "Retroid Pocket Classic": "jesussaves-dev/Banana-Pocket",
+}
+
 DEFAULT_MODEL = "Anbernic RG DS Plus"
+
+
+def repo_for_model(model: str) -> str:
+    """Return the GitHub repository (owner/repo) for a given handheld model."""
+    return MODEL_REPOS.get(model, DEFAULT_REPO)
+
+
+def repo_for_asset(asset_name: str) -> str:
+    """Return the GitHub repository (owner/repo) that publishes the given asset."""
+    for model, asset in MODELS.items():
+        if asset == asset_name:
+            return MODEL_REPOS.get(model, DEFAULT_REPO)
+    return DEFAULT_REPO
 
 CHUNK_SIZE = 1 << 20          # 1 MiB streaming granularity
 # Raw \\.\PhysicalDriveN writes must be whole sectors; Windows rejects a
@@ -314,15 +338,15 @@ def _fetch_json(url: str) -> object:
         raise FlasherError(f"Unexpected error talking to GitHub: {exc}") from exc
 
 
-def _release_candidates() -> list[dict]:
+def _release_candidates(repo: str = DEFAULT_REPO) -> list[dict]:
     """
     Return candidate release objects, newest first.
 
     The documented `/releases/latest` endpoint is tried first, exactly as
-    requested -- but the BananaLinux project currently ships **only
-    pre-releases**, and GitHub's `latest` endpoint deliberately ignores
-    pre-releases (returning 404). We therefore fall back to the release list
-    and walk it newest-first, skipping drafts, so the tool keeps working.
+    requested -- but upstream projects currently ship pre-releases, and
+    GitHub's `latest` endpoint deliberately ignores pre-releases (returning
+    404). We therefore fall back to the release list and walk it newest-first,
+    skipping drafts, so the tool keeps working.
     """
     errors: list[FlasherError] = []
     releases: list[dict] = []
@@ -335,15 +359,18 @@ def _release_candidates() -> list[dict]:
         seen.add(key)
         releases.append(release)
 
+    latest_api = f"https://api.github.com/repos/{repo}/releases/latest"
+    list_api = f"https://api.github.com/repos/{repo}/releases"
+
     try:
-        latest = _fetch_json(RELEASES_API)
+        latest = _fetch_json(latest_api)
         if isinstance(latest, dict):
             add(latest)
     except FlasherError as exc:
         errors.append(exc)
 
     try:
-        listing = _fetch_json(f"{RELEASES_LIST_API}?per_page=30")
+        listing = _fetch_json(f"{list_api}?per_page=30")
         if isinstance(listing, list):
             for release in listing:
                 if isinstance(release, dict) and not release.get("draft"):
@@ -358,18 +385,22 @@ def _release_candidates() -> list[dict]:
     return releases
 
 
-def resolve_release_asset(asset_name: str) -> dict:
+def resolve_release_asset(asset_name: str, repo: str | None = None) -> dict:
     """
-    Return {'name', 'url', 'size', 'tag', 'checksum'} for `asset_name`.
+    Return {'name', 'url', 'size', 'tag', 'checksum', 'repo'} for `asset_name`.
 
     The newest non-draft release that actually contains the requested asset
     wins. `checksum` is the matching SHA-256 from the release's SHA256SUMS
-    file when one is published, otherwise None.
+    file when one is published, or from the release asset's sha256 digest,
+    otherwise None.
     """
+    if repo is None:
+        repo = repo_for_asset(asset_name)
+
     seen_failure: str | None = None
     tried: list[str] = []
 
-    for release in _release_candidates():
+    for release in _release_candidates(repo):
         assets = {
             a.get("name"): a for a in (release.get("assets") or []) if a.get("name")
         }
@@ -399,12 +430,20 @@ def resolve_release_asset(asset_name: str) -> dict:
                 checksum = digest
                 break
 
+        # If no separate checksums file was published, check if GitHub's asset
+        # metadata provides a sha256 digest.
+        if checksum is None:
+            raw_digest = asset.get("digest") or ""
+            if raw_digest.startswith("sha256:"):
+                checksum = raw_digest.split(":", 1)[1].strip()
+
         return {
             "name": asset["name"],
             "url": asset["browser_download_url"],
             "size": int(asset.get("size") or 0),
             "tag": tag,
             "checksum": checksum,
+            "repo": repo,
         }
 
     if tried:
@@ -412,10 +451,11 @@ def resolve_release_asset(asset_name: str) -> dict:
             f"'{asset_name}' was not found in these recent releases: "
             + ", ".join(tried[:6])
         )
+    releases_page = f"https://github.com/{repo}/releases/latest"
     raise FlasherError(
         seen_failure
-        or f"No published release with assets was found for {GITHUB_REPO}. "
-           "See " + RELEASES_PAGE
+        or f"No published release with assets was found for {repo}. "
+           "See " + releases_page
     )
 
 
@@ -1875,9 +1915,10 @@ class FlashWorker(threading.Thread):
 
             # ---- 1. Download -------------------------------------------
             self.status("Downloading image ...")
+            repo = self.release.get("repo") or repo_for_model(self.model)
             self.log(
                 f"Downloading {self.asset_name} ({self.release.get('tag')}) "
-                f"from GitHub ..."
+                f"from GitHub ({repo}) ..."
             )
             if self.release.get("size"):
                 self.log(f"  Asset size: {format_bytes(self.release['size'])}")
@@ -2283,8 +2324,8 @@ class BananaFlasherApp(tk.Tk):
         left.pack(side="left", anchor="w")
         tk.Label(left, text="🍌  " + APP_NAME, bg=HEADER_BG, fg=HEADER_TX,
                  font=(self._font_ui, 21, "bold")).pack(anchor="w")
-        tk.Label(left, text="Flash BananaLinux to a microSD card for the "
-                            "Anbernic RG DS family.",
+        tk.Label(left, text="Flash BananaLinux & BananaOS to a microSD card for "
+                            "supported handhelds.",
                  bg=HEADER_BG, fg=HEADER_SUB,
                  font=(self._font_ui, 10)).pack(anchor="w", pady=(3, 0))
 
@@ -2376,8 +2417,8 @@ class BananaFlasherApp(tk.Tk):
         tk.Label(
             self,
             text="⚠   Writing to a drive erases everything on it — double-check "
-                 "the device above. BananaLinux is a community project; this "
-                 "tool is unaffiliated with Anbernic.",
+                 "the device above. BananaLinux and BananaOS are community "
+                 "projects; this tool is unaffiliated with Anbernic or Retroid.",
             bg=BG, fg=MUTED, font=(self._font_ui, 9), justify="left",
             wraplength=800, anchor="w", padx=24, pady=12,
         ).pack(fill="x")
@@ -2442,6 +2483,7 @@ class BananaFlasherApp(tk.Tk):
     def _query_release_async(self) -> None:
         model = self.model_var.get()
         asset = MODELS[model]
+        repo = repo_for_model(model)
 
         with self._releases_lock:
             if asset in self.release_cache:
@@ -2450,7 +2492,7 @@ class BananaFlasherApp(tk.Tk):
 
         def worker() -> None:
             try:
-                info = resolve_release_asset(asset)
+                info = resolve_release_asset(asset, repo=repo)
                 self.release_cache[asset] = info
                 self.emit(("release", asset, info, None))
             except FlasherError as exc:
@@ -2506,8 +2548,9 @@ class BananaFlasherApp(tk.Tk):
         self.progress.configure(style="Horizontal.TProgressbar")
         self.detail_var.set("")
         self._set_running(True)
+        repo = release.get("repo") or repo_for_model(model)
         self.log("—" * 60)
-        self.log(f"Selected handheld : {model}")
+        self.log(f"Selected handheld : {model} ({repo})")
         self.log(f"Selected drive    : {device['label']}")
         self.log(f"Release           : {release['tag']}")
 
@@ -2523,13 +2566,14 @@ class BananaFlasherApp(tk.Tk):
         checksum_line = ""
         if release.get("checksum"):
             checksum_line = f"\nSHA-256: {release['checksum'][:16]}… (will be verified)\n"
+        repo = release.get("repo") or repo_for_model(model)
         message = (
             f"You are about to ERASE and overwrite:\n\n"
             f"    {device['path']}\n"
             f"    {device['label']}\n"
             f"    capacity: {size}\n\n"
             f"with:\n\n"
-            f"    {MODELS[model]}  (release {release['tag']})\n"
+            f"    {MODELS[model]}  (release {release['tag']} from {repo})\n"
             f"{checksum_line}\n"
             "ALL data on that drive will be permanently destroyed, including its "
             "partition table.\n\nDo you want to continue?"
@@ -2713,7 +2757,8 @@ class BananaFlasherApp(tk.Tk):
             asset, info, error = payload
             if info:
                 self.release_cache[asset] = info
-                self.log(f"Latest release {info['tag']}: {info['name']} "
+                repo = info.get("repo") or repo_for_asset(asset)
+                self.log(f"Latest release {info['tag']} ({repo}): {info['name']} "
                          f"({format_bytes(info['size']) if info['size'] else '?'})")
             else:
                 self.log(f"Could not resolve release asset: {error}")
