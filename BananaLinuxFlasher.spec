@@ -39,7 +39,17 @@ docs_dir = os.path.join(project_root, "docs")
 icon_ico = os.path.join(docs_dir, "banana.ico")
 icon_png = os.path.join(docs_dir, "banana.png")
 
-datas = [(path, "docs") for path in (icon_ico, icon_png) if os.path.exists(path)]
+icon_sprite = os.path.join(docs_dir, "banana-sprite.png")
+fonts_dir = os.path.join(docs_dir, "fonts")
+
+datas = [(path, "docs") for path in (icon_ico, icon_png, icon_sprite)
+         if os.path.exists(path)]
+# Banana Blast fonts (OFL) are registered privately at runtime; the app falls
+# back to system fonts when they are missing.
+if os.path.isdir(fonts_dir):
+    datas += [(os.path.join(fonts_dir, name), os.path.join("docs", "fonts"))
+              for name in sorted(os.listdir(fonts_dir))
+              if name.endswith((".ttf", ".txt"))]
 app_icon = icon_ico if os.path.exists(icon_ico) else None
 
 # --- Windows version resource ---------------------------------------------

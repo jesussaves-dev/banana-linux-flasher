@@ -141,23 +141,30 @@ ZERO_WIPE_BYTES = 10 * 1024 * 1024   # "first 10MB" zeroing on Linux
 # ---------------------------------------------------------------------------
 #  Visual theme -- one cohesive palette shared by every widget
 # ---------------------------------------------------------------------------
-BG         = "#eef1f6"   # app canvas
-SURFACE    = "#ffffff"   # cards
-INK        = "#1f2733"   # primary text
-MUTED      = "#697485"   # secondary text
-FAINT      = "#9aa4b2"   # hints / disabled text
-BORDER     = "#dbe1ea"   # hairlines
-ACCENT     = "#f2b134"   # banana amber
-ACCENT_DK  = "#c8860c"   # amber for text-on-light
-ACCENT_HOV = "#f7c257"   # amber hover
-ACCENT_TX  = "#3a2a00"   # text on amber
-HEADER_BG  = "#1d2733"   # dark header slab
+# "Banana Blast", matching the Banana Pocket site (site/style.css). Colours sit
+# on the Mega Drive's 3-bit grid (00 24 49 6d 92 b6 db ff).
+BG         = "#000000"   # --void: app canvas
+SURFACE    = "#000000"   # cards are outlined, not filled
+INK        = "#ffffff"   # --ink
+MUTED      = "#929292"   # --dim
+FAINT      = "#6d6d6d"   # hints / disabled text
+BORDER     = "#494949"   # --line
+ACCENT     = "#ff00b6"   # --a: pink, primary action
+ACCENT_TX  = "#000000"   # text on pink
+CYAN       = "#00dbff"   # --b: rails, ghost buttons, focus
+LABEL      = "#ffdb00"   # --label: yellow headings
+HEADER_BG  = "#000000"
 HEADER_TX  = "#ffffff"
-HEADER_SUB = "#aab6c4"
-LOG_BG     = "#161c24"   # activity log
-LOG_TX     = "#d8e0ea"
-LOG_DIM    = "#7f8b9b"
-DANGER     = "#c0392b"
+HEADER_SUB = "#929292"
+LOG_BG     = "#0a0a0a"   # activity log panel
+LOG_TX     = "#dbdbdb"
+LOG_DIM    = "#6d6d6d"
+DANGER     = "#ff2424"
+# The site's --chrome title gradient, as stacked bands for the header rule.
+CHROME_STOPS = ("#ffffff", "#b6ffff", "#00dbff", "#2449db",
+                "#ff6d00", "#ffb600", "#ffff49")
+PIXEL_FONT = "Press Start 2P"
+BODY_FONT = "Chakra Petch"
 
 # sudo is resolved once at runtime; an empty list means "we are already root".
 SUDO_PREFIX: list[str] = []
@@ -209,6 +216,149 @@ def pick_family(root, preferences: tuple[str, ...], fallback: str) -> str:
         if name.lower() in available:
             return name
     return fallback
+
+
+def register_bundled_fonts() -> None:
+    """
+    Make the bundled OFL fonts visible to Tk for this process only.
+
+    Must run before the Tk root exists. Windows uses AddFontResourceExW with
+    FR_PRIVATE; Linux adds them to fontconfig's in-process app font set.
+    Anything else (or any failure) silently leaves the system fallbacks.
+    """
+    folder = resource_path(os.path.join("docs", "fonts"))
+    try:
+        files = [os.path.join(folder, n) for n in sorted(os.listdir(folder))
+                 if n.lower().endswith(".ttf")]
+    except OSError:
+        return
+    if not files:
+        return
+    try:
+        import ctypes
+        import ctypes.util
+        if IS_WINDOWS:
+            fr_private = 0x10
+            add = ctypes.windll.gdi32.AddFontResourceExW
+            add.argtypes = [ctypes.c_wchar_p, ctypes.c_uint, ctypes.c_void_p]
+            for path in files:
+                add(path, fr_private, None)
+        elif sys.platform.startswith("linux"):
+            lib = ctypes.util.find_library("fontconfig") or "libfontconfig.so.1"
+            fc = ctypes.CDLL(lib)
+            fc.FcConfigAppFontAddFile.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+            for path in files:
+                fc.FcConfigAppFontAddFile(None, os.fsencode(path))
+    except Exception:
+        pass
+
+
+class PixelButton(tk.Canvas):
+    """
+    The site's .btn: a skewed slab with a hard offset shadow.
+
+    variant "main" = pink face / cyan shadow, "ghost" = black face, cyan
+    outline / pink shadow. Hover lifts it onto a yellow shadow, press sinks it.
+    Supports configure(state="normal"|"disabled") like a ttk.Button.
+    """
+
+    SHADOW = 5
+    SKEW = 6     # px of horizontal lean across the button height
+
+    def __init__(self, parent, text: str, command=None, variant: str = "main",
+                 font=None, bg: str = BG, state: str = "normal"):
+        self._font = tkfont.Font(parent, font=font or ("TkDefaultFont", 9))
+        self._text = text
+        self._command = command
+        self._variant = variant
+        self._state = state
+        self._hover = False
+        self._pressed = False
+        self._focused = False
+        pad_x, pad_y = 18, 10
+        self._face_w = self._font.measure(text) + 2 * pad_x + self.SKEW
+        self._face_h = self._font.metrics("linespace") + 2 * pad_y
+        pad = 3   # room for the hover lift
+        super().__init__(
+            parent, width=self._face_w + self.SHADOW + 2 * pad,
+            height=self._face_h + self.SHADOW + 2 * pad, bg=bg,
+            highlightthickness=0, bd=0,
+            takefocus=0 if state == "disabled" else 1,
+            cursor="hand2" if state != "disabled" else "",
+        )
+        self._pad = pad
+        self.bind("<Enter>", lambda e: self._set(hover=True))
+        self.bind("<Leave>", lambda e: self._set(hover=False, pressed=False))
+        self.bind("<ButtonPress-1>", lambda e: self._set(pressed=True))
+        self.bind("<ButtonRelease-1>", self._release)
+        self.bind("<FocusIn>", lambda e: self._set(focused=True))
+        self.bind("<FocusOut>", lambda e: self._set(focused=False))
+        self.bind("<KeyPress-space>", lambda e: self._invoke())
+        self.bind("<KeyPress-Return>", lambda e: self._invoke())
+        self._draw()
+
+    # ttk.Button-compatible state handling
+    def configure(self, cnf=None, **kw):
+        if "state" in kw:
+            self._state = kw.pop("state")
+            self.config_cursor()
+            self._draw()
+        if cnf or kw:
+            return super().configure(cnf, **kw)
+        return None
+
+    config = configure
+
+    def config_cursor(self) -> None:
+        enabled = self._state != "disabled"
+        super().configure(cursor="hand2" if enabled else "",
+                          takefocus=1 if enabled else 0)
+
+    def _set(self, **flags) -> None:
+        for key, value in flags.items():
+            setattr(self, "_" + key, value)
+        self._draw()
+
+    def _release(self, event) -> None:
+        was_pressed = self._pressed
+        self._set(pressed=False)
+        inside = 0 <= event.x < self.winfo_width() and 0 <= event.y < self.winfo_height()
+        if was_pressed and inside:
+            self._invoke()
+
+    def _invoke(self) -> None:
+        if self._state != "disabled" and self._command:
+            self._command()
+
+    def _slab(self, x: int, y: int, **kw) -> None:
+        w, h, k = self._face_w, self._face_h, self.SKEW
+        self.create_polygon(x + k, y, x + w, y, x + w - k, y + h, x, y + h, **kw)
+
+    def _draw(self) -> None:
+        self.delete("all")
+        disabled = self._state == "disabled"
+        if self._variant == "main":
+            face, edge, ink, shadow = ACCENT, ACCENT, ACCENT_TX, CYAN
+        else:
+            face, edge, ink, shadow = BG, CYAN, CYAN, ACCENT
+        if disabled:
+            face, edge, ink, shadow = "#121212", BORDER, FAINT, "#121212"
+
+        lift = 0
+        if not disabled:
+            if self._pressed:
+                lift = self.SHADOW - 1
+            elif self._hover or self._focused:
+                lift = -2
+                shadow = LABEL
+        base = self._pad
+        if not (self._pressed and not disabled):
+            self._slab(base + self.SHADOW, base + self.SHADOW, fill=shadow,
+                       outline=shadow)
+        x = y = base + lift
+        self._slab(x, y, fill=face, outline=edge, width=3)
+        self.create_text(x + self._face_w / 2, y + self._face_h / 2 + 1,
+                         text=self._text.upper(), fill=ink, font=self._font)
 
 
 def is_elevated() -> bool:
@@ -2098,14 +2248,16 @@ class BananaFlasherApp(tk.Tk):
     POLL_MS = 80
 
     def __init__(self):
+        register_bundled_fonts()
         super().__init__()
         self.title(f"{APP_NAME} {APP_VERSION}")
         self.minsize(780, 700)
-        self.geometry("860x780")
+        self.geometry("860x820")
         self.configure(background=BG)
 
         # Window / taskbar icon (bundled next to the source, or via PyInstaller).
         self._icon_image: tk.PhotoImage | None = None
+        self._sprite_image: tk.PhotoImage | None = None
         self._apply_window_icon()
 
         self.queue: queue.Queue = queue.Queue()
@@ -2164,9 +2316,9 @@ class BananaFlasherApp(tk.Tk):
         # --- typography -----------------------------------------------------
         ui_family = pick_family(
             self,
-            ("SF Pro Text", "Helvetica Neue", "Segoe UI Variable", "Segoe UI",
-             "Inter", "Ubuntu", "Cantarell", "Noto Sans", "DejaVu Sans",
-             "Helvetica", "Arial"),
+            (BODY_FONT, "SF Pro Text", "Helvetica Neue", "Segoe UI Variable",
+             "Segoe UI", "Inter", "Ubuntu", "Cantarell", "Noto Sans",
+             "DejaVu Sans", "Helvetica", "Arial"),
             "Helvetica",
         )
         mono_family = pick_family(
@@ -2175,14 +2327,19 @@ class BananaFlasherApp(tk.Tk):
              "Consolas", "Ubuntu Mono", "DejaVu Sans Mono", "Courier New"),
             "Courier",
         )
+        # Press Start 2P is a bitmap-style face: headings and buttons only, at
+        # small sizes. Without it, fall back to the bold body face.
+        px_family = pick_family(self, (PIXEL_FONT,), "")
         self._font_ui = ui_family
         self._font_mono = mono_family
         self._font_base = (ui_family, 10)
+        if px_family:
+            self._font_px = lambda size: (px_family, size)
+        else:
+            self._font_px = lambda size: (ui_family, size + 3, "bold")
 
-        f_title = (ui_family, 21, "bold")
         f_sub = (ui_family, 10)
         f_body = (ui_family, 10)
-        f_button = (ui_family, 10, "bold")
         f_status = (ui_family, 13, "bold")
         f_small = (ui_family, 9)
 
@@ -2205,86 +2362,71 @@ class BananaFlasherApp(tk.Tk):
         # --- header slab ----------------------------------------------------
         style.configure("Header.TFrame", background=HEADER_BG)
         style.configure("HeaderTitle.TLabel", background=HEADER_BG,
-                        foreground=HEADER_TX, font=f_title)
+                        foreground=HEADER_TX, font=self._font_px(14))
         style.configure("HeaderSub.TLabel", background=HEADER_BG,
                         foreground=HEADER_SUB, font=f_sub)
         style.configure("HeaderPill.TLabel", background=HEADER_BG,
-                        foreground=ACCENT, font=(ui_family, 10, "bold"))
-
-        # --- buttons --------------------------------------------------------
-        for name, bg_col, fg_col, border, bw in (
-            ("Accent.TButton", ACCENT, ACCENT_TX, ACCENT, 0),
-            ("Secondary.TButton", SURFACE, INK, BORDER, 1),
-        ):
-            style.configure(
-                name, background=bg_col, foreground=fg_col, font=f_button,
-                padding=(18, 9), borderwidth=bw, relief="solid",
-                bordercolor=border, lightcolor=bg_col, darkcolor=bg_col,
-                focuscolor=bg_col,
-            )
-        style.map(
-            "Accent.TButton",
-            background=[("disabled", "#efd9a6"), ("active", ACCENT_HOV),
-                        ("pressed", ACCENT_DK)],
-            foreground=[("disabled", "#a08c5c")],
-        )
-        style.map(
-            "Secondary.TButton",
-            background=[("disabled", SURFACE), ("active", "#eaeef4"),
-                        ("pressed", "#e0e6ee")],
-            foreground=[("disabled", FAINT)],
-            bordercolor=[("active", "#c7cfda")],
-        )
+                        foreground=LABEL, font=self._font_px(8))
 
         # --- inputs ---------------------------------------------------------
         style.configure("TRadiobutton", background=SURFACE, foreground=INK,
-                        font=f_body, padding=(2, 6), indicatorsize=15)
+                        font=f_body, padding=(2, 3), indicatorsize=15,
+                        indicatorbackground=BG, indicatorforeground=ACCENT,
+                        upperbordercolor=BORDER, lowerbordercolor=BORDER)
         style.map(
             "TRadiobutton",
-            foreground=[("selected", ACCENT_DK), ("active", INK)],
+            foreground=[("selected", ACCENT), ("active", INK)],
             background=[("active", SURFACE)],
+            indicatorbackground=[("selected", BG), ("active", "#121212")],
+            indicatorforeground=[("selected", ACCENT)],
         )
         style.configure("TCheckbutton", background=SURFACE, foreground=MUTED,
-                        font=f_small, padding=(2, 4), indicatorsize=14)
+                        font=f_small, padding=(2, 4), indicatorsize=14,
+                        indicatorbackground=BG, indicatorforeground=CYAN,
+                        upperbordercolor=BORDER, lowerbordercolor=BORDER)
         style.map(
             "TCheckbutton",
             background=[("active", SURFACE)],
             foreground=[("active", INK)],
         )
-        style.configure("TCombobox", fieldbackground=SURFACE, background=SURFACE,
-                        foreground=INK, bordercolor=BORDER, arrowcolor=MUTED,
+        style.configure("TCombobox", fieldbackground=LOG_BG, background=LOG_BG,
+                        foreground=INK, bordercolor=BORDER, arrowcolor=CYAN,
                         lightcolor=SURFACE, darkcolor=SURFACE,
                         padding=(10, 7), relief="flat")
         style.map(
             "TCombobox",
-            fieldbackground=[("readonly", SURFACE), ("disabled", "#f4f6f9")],
+            fieldbackground=[("readonly", LOG_BG), ("disabled", "#121212")],
             foreground=[("readonly", INK), ("disabled", FAINT)],
-            bordercolor=[("focus", ACCENT), ("hover", "#c7cfda")],
+            background=[("readonly", LOG_BG), ("active", LOG_BG)],
+            selectbackground=[("readonly", LOG_BG)],
+            selectforeground=[("readonly", INK)],
+            bordercolor=[("focus", CYAN), ("hover", MUTED)],
             arrowcolor=[("disabled", FAINT)],
         )
-        style.configure("TEntry", fieldbackground=SURFACE, foreground=INK,
+        style.configure("TEntry", fieldbackground=LOG_BG, foreground=INK,
+                        insertcolor=INK,
                         bordercolor=BORDER, lightcolor=SURFACE, darkcolor=SURFACE,
                         padding=(8, 7), relief="flat")
-        style.map("TEntry", bordercolor=[("focus", ACCENT)])
+        style.map("TEntry", bordercolor=[("focus", CYAN)])
 
         # --- progress -------------------------------------------------------
-        style.configure("Horizontal.TProgressbar", troughcolor="#e4e9f0",
-                        background=ACCENT, bordercolor="#e4e9f0",
+        style.configure("Horizontal.TProgressbar", troughcolor=LOG_BG,
+                        background=ACCENT, bordercolor=BORDER,
                         lightcolor=ACCENT, darkcolor=ACCENT, thickness=16)
-        style.configure("Done.Horizontal.TProgressbar", troughcolor="#e4e9f0",
-                        background="#3a9d5d", bordercolor="#e4e9f0",
-                        lightcolor="#3a9d5d", darkcolor="#3a9d5d", thickness=16)
+        style.configure("Done.Horizontal.TProgressbar", troughcolor=LOG_BG,
+                        background=CYAN, bordercolor=BORDER,
+                        lightcolor=CYAN, darkcolor=CYAN, thickness=16)
 
         # --- dark scrollbar for the log ------------------------------------
-        style.configure("Log.Vertical.TScrollbar", background="#2b3644",
+        style.configure("Log.Vertical.TScrollbar", background="#242424",
                         troughcolor=LOG_BG, bordercolor=LOG_BG,
-                        arrowcolor=LOG_DIM, lightcolor="#2b3644",
-                        darkcolor="#2b3644", relief="flat")
+                        arrowcolor=LOG_DIM, lightcolor="#242424",
+                        darkcolor="#242424", relief="flat")
         style.map("Log.Vertical.TScrollbar",
-                  background=[("active", "#3a4757")])
+                  background=[("active", "#494949")])
 
         # Keep the combobox dropdown list in theme.
-        self.option_add("*TCombobox*Listbox.background", SURFACE)
+        self.option_add("*TCombobox*Listbox.background", LOG_BG)
         self.option_add("*TCombobox*Listbox.foreground", INK)
         self.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
         self.option_add("*TCombobox*Listbox.selectForeground", ACCENT_TX)
@@ -2292,19 +2434,19 @@ class BananaFlasherApp(tk.Tk):
 
     # --- small reusable builders ------------------------------------------
     def _card(self, parent, step: int, title: str):
-        """A bordered white card with a numbered accent badge and heading."""
+        """An outlined panel with a pink step badge and a yellow pixel heading."""
         outer = tk.Frame(parent, bg=SURFACE, bd=0,
-                         highlightbackground=BORDER, highlightthickness=1)
-        outer.pack(fill="x", pady=(0, 14))
-        inner = tk.Frame(outer, bg=SURFACE, padx=18, pady=15)
+                         highlightbackground=BORDER, highlightthickness=2)
+        outer.pack(fill="x", pady=(0, 10))
+        inner = tk.Frame(outer, bg=SURFACE, padx=18, pady=11)
         inner.pack(fill="both", expand=True)
 
         head = tk.Frame(inner, bg=SURFACE)
-        head.pack(fill="x", anchor="w")
+        head.pack(fill="x", anchor="w", pady=(0, 4))
         tk.Label(head, text=str(step), bg=ACCENT, fg=ACCENT_TX,
-                 font=(self._font_ui, 10, "bold"), padx=8, pady=1).pack(side="left")
-        tk.Label(head, text=title, bg=SURFACE, fg=INK,
-                 font=(self._font_ui, 12, "bold")).pack(side="left", padx=(10, 0))
+                 font=self._font_px(9), padx=7, pady=4).pack(side="left")
+        tk.Label(head, text=title.upper(), bg=SURFACE, fg=LABEL,
+                 font=self._font_px(9)).pack(side="left", padx=(12, 0))
         return inner
 
     def _hint(self, parent, text: str, wrap: int):
@@ -2312,28 +2454,54 @@ class BananaFlasherApp(tk.Tk):
                  font=(self._font_ui, 9), justify="left", wraplength=wrap,
                  anchor="w").pack(fill="x", anchor="w", pady=(8, 0))
 
+    def _button(self, parent, text: str, command, variant: str = "main",
+                state: str = "normal", bg: str = SURFACE) -> PixelButton:
+        return PixelButton(parent, text, command=command, variant=variant,
+                           font=self._font_px(8), bg=bg, state=state)
+
+    def _chrome_rule(self, parent, height: int = 7) -> None:
+        """The site's chrome gradient, stacked as 1px bands under the header."""
+        rule = tk.Canvas(parent, height=height, bg=BG, highlightthickness=0, bd=0)
+        rule.pack(fill="x")
+        last = len(CHROME_STOPS) - 1
+        for row in range(height):
+            colour = CHROME_STOPS[round(row * last / max(height - 1, 1))]
+            rule.create_line(0, row, 4000, row, fill=colour)
+
+    def _load_sprite(self) -> tk.PhotoImage | None:
+        path = resource_path(os.path.join("docs", "banana-sprite.png"))
+        try:
+            return tk.PhotoImage(file=path).zoom(3)
+        except Exception:
+            return None
+
     # --------------------------------------------------------------------- UI
     def _build_ui(self) -> None:
         # ---- header slab ---------------------------------------------------
         header = tk.Frame(self, bg=HEADER_BG)
         header.pack(fill="x")
-        header_inner = tk.Frame(header, bg=HEADER_BG, padx=24, pady=18)
+        header_inner = tk.Frame(header, bg=HEADER_BG, padx=24, pady=12)
         header_inner.pack(fill="x")
+
+        self._sprite_image = self._load_sprite()
+        if self._sprite_image is not None:
+            tk.Label(header_inner, image=self._sprite_image, bg=HEADER_BG,
+                     bd=0).pack(side="left", padx=(0, 16))
 
         left = tk.Frame(header_inner, bg=HEADER_BG)
         left.pack(side="left", anchor="w")
-        tk.Label(left, text="🍌  " + APP_NAME, bg=HEADER_BG, fg=HEADER_TX,
-                 font=(self._font_ui, 21, "bold")).pack(anchor="w")
-        tk.Label(left, text="Flash BananaLinux & BananaOS to a microSD card for "
-                            "supported handhelds.",
+        tk.Label(left, text=APP_NAME.upper(), bg=HEADER_BG, fg=HEADER_TX,
+                 font=self._font_px(14)).pack(anchor="w")
+        tk.Label(left, text="Flash Banana DS or Banana Pocket to a microSD card.",
                  bg=HEADER_BG, fg=HEADER_SUB,
-                 font=(self._font_ui, 10)).pack(anchor="w", pady=(3, 0))
+                 font=(self._font_ui, 10)).pack(anchor="w", pady=(8, 0))
 
-        tk.Label(header_inner, text=f"v{APP_VERSION}", bg=HEADER_BG, fg=ACCENT,
-                 font=(self._font_ui, 10, "bold")).pack(side="right", anchor="n")
+        tk.Label(header_inner, text=f"V{APP_VERSION}", bg=HEADER_BG, fg=LABEL,
+                 font=self._font_px(8)).pack(side="right", anchor="n")
+        self._chrome_rule(self)
 
         # ---- body ----------------------------------------------------------
-        body = tk.Frame(self, bg=BG, padx=24, pady=18)
+        body = tk.Frame(self, bg=BG, padx=24, pady=12)
         body.pack(fill="both", expand=True)
 
         # ---- step 1 : model ------------------------------------------------
@@ -2355,9 +2523,8 @@ class BananaFlasherApp(tk.Tk):
             font=self._font_base,
         )
         self.device_combo.pack(side="left", fill="x", expand=True)
-        self.refresh_btn = ttk.Button(drive_row, text="Refresh",
-                                      style="Secondary.TButton",
-                                      command=self.refresh_devices)
+        self.refresh_btn = self._button(drive_row, "Refresh",
+                                        self.refresh_devices, variant="ghost")
         self.refresh_btn.pack(side="left", padx=(10, 0))
         self._hint(drive_box,
                    "Only physical drives are listed. The system/OS disk is "
@@ -2372,39 +2539,39 @@ class BananaFlasherApp(tk.Tk):
             action_box, variable=self.progress_var, maximum=100.0,
             mode="determinate", style="Horizontal.TProgressbar",
         )
-        self.progress.pack(fill="x", pady=(10, 6))
+        self.progress.pack(fill="x", pady=(8, 6))
         ttk.Label(action_box, textvariable=self.detail_var,
                   style="Detail.TLabel").pack(anchor="w")
 
         btn_row = ttk.Frame(action_box, style="Card.TFrame")
-        btn_row.pack(fill="x", pady=(14, 0))
-        self.start_btn = ttk.Button(btn_row, text="Download & Flash",
-                                    style="Accent.TButton",
-                                    command=self.start_flash)
+        btn_row.pack(fill="x", pady=(8, 0))
+        self.start_btn = self._button(btn_row, "Download & Flash",
+                                      self.start_flash)
         self.start_btn.pack(side="left")
-        self.cancel_btn = ttk.Button(btn_row, text="Cancel",
-                                     style="Secondary.TButton",
-                                     command=self.cancel_flash, state="disabled")
-        self.cancel_btn.pack(side="left", padx=(10, 0))
+        self.cancel_btn = self._button(btn_row, "Cancel", self.cancel_flash,
+                                       variant="ghost", state="disabled")
+        self.cancel_btn.pack(side="left", padx=(8, 0))
         ttk.Checkbutton(btn_row, text="Keep downloaded image",
                         variable=self.keep_var).pack(side="right")
 
         # ---- activity log --------------------------------------------------
         log_outer = tk.Frame(body, bg=SURFACE, bd=0,
-                             highlightbackground=BORDER, highlightthickness=1)
-        log_outer.pack(fill="both", expand=True, pady=(0, 14))
+                             highlightbackground=BORDER, highlightthickness=2)
+        log_outer.pack(fill="both", expand=True, pady=(0, 4))
         log_head = tk.Frame(log_outer, bg=SURFACE, padx=18, pady=0)
-        log_head.pack(fill="x", pady=(12, 0))
-        tk.Label(log_head, text="Activity log", bg=SURFACE, fg=INK,
-                 font=(self._font_ui, 12, "bold")).pack(side="left")
+        log_head.pack(fill="x", pady=(11, 0))
+        tk.Label(log_head, text="ACTIVITY LOG", bg=SURFACE, fg=LABEL,
+                 font=self._font_px(9)).pack(side="left")
 
         log_area = tk.Frame(log_outer, bg=LOG_BG, padx=1, pady=1)
-        log_area.pack(fill="both", expand=True, padx=18, pady=(10, 16))
+        log_area.pack(fill="both", expand=True, padx=18, pady=(8, 14))
         self.log_widget = tk.Text(
-            log_area, height=9, wrap="word", state="disabled",
+            log_area, height=6, wrap="word", state="disabled",
             font=(self._font_mono, 9), background=LOG_BG, foreground=LOG_TX,
-            insertbackground=LOG_TX, selectbackground="#33455c",
+            insertbackground=LOG_TX, selectbackground=ACCENT,
+            selectforeground=ACCENT_TX,
             relief="flat", borderwidth=0, padx=12, pady=10,
+            highlightthickness=0,
         )
         log_scroll = ttk.Scrollbar(log_area, orient="vertical",
                                    command=self.log_widget.yview,
@@ -2420,8 +2587,8 @@ class BananaFlasherApp(tk.Tk):
                  "the device above. BananaLinux and BananaOS are community "
                  "projects; this tool is unaffiliated with Anbernic or Retroid.",
             bg=BG, fg=MUTED, font=(self._font_ui, 9), justify="left",
-            wraplength=800, anchor="w", padx=24, pady=12,
-        ).pack(fill="x")
+            wraplength=800, anchor="w", padx=24, pady=8,
+        ).pack(fill="x", side="bottom", before=body)
 
     # ------------------------------------------------------------------ utils
     def log(self, message: str) -> None:
@@ -2630,7 +2797,8 @@ class BananaFlasherApp(tk.Tk):
         """Modal password prompt; returns the password or None if cancelled."""
         dialog = tk.Toplevel(self)
         dialog.title("sudo password required")
-        dialog.configure(background=SURFACE)
+        dialog.configure(background=SURFACE, highlightbackground=BORDER,
+                         highlightthickness=2)
         dialog.transient(self)
         dialog.resizable(False, False)
         dialog.grab_set()
@@ -2640,10 +2808,10 @@ class BananaFlasherApp(tk.Tk):
 
         head = tk.Frame(wrap, bg=SURFACE)
         head.pack(fill="x")
-        tk.Label(head, text="🔒", bg=SURFACE, fg=ACCENT_DK,
+        tk.Label(head, text="🔒", bg=SURFACE, fg=ACCENT,
                  font=(self._font_ui, 14)).pack(side="left")
-        tk.Label(head, text="Elevated rights required", bg=SURFACE, fg=INK,
-                 font=(self._font_ui, 13, "bold")).pack(side="left", padx=(8, 0))
+        tk.Label(head, text="ELEVATED RIGHTS REQUIRED", bg=SURFACE, fg=LABEL,
+                 font=self._font_px(9)).pack(side="left", padx=(10, 0))
 
         tk.Label(
             wrap,
@@ -2670,10 +2838,9 @@ class BananaFlasherApp(tk.Tk):
 
         buttons = tk.Frame(wrap, bg=SURFACE)
         buttons.pack(fill="x", pady=(16, 0))
-        ttk.Button(buttons, text="Unlock", style="Accent.TButton",
-                   command=accept).pack(side="right")
-        ttk.Button(buttons, text="Cancel", style="Secondary.TButton",
-                   command=cancel).pack(side="right", padx=(0, 10))
+        self._button(buttons, "Unlock", accept).pack(side="right")
+        self._button(buttons, "Cancel", cancel,
+                     variant="ghost").pack(side="right", padx=(0, 8))
         dialog.bind("<Return>", accept)
         dialog.bind("<Escape>", cancel)
 
