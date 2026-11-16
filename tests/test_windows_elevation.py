@@ -262,8 +262,10 @@ class SpawnElevatedWriteTests(unittest.TestCase):
         with open(self.request, "w", encoding="utf-8") as handle:
             json.dump({"device": DEVICE}, handle)
 
-    def _run(self, shell, kernel, cancel=None, last_error=0, cancel_path=None):
-        progress, status, log = [], [], []
+    def _run(self, shell, kernel, cancel=None, last_error=0, cancel_path=None,
+             log=None):
+        progress, status = [], []
+        log = [] if log is None else log
         patchers = [
             mock.patch.object(ctypes, "WinDLL", create=True,
                               new=lambda name, **kw: shell
@@ -276,7 +278,8 @@ class SpawnElevatedWriteTests(unittest.TestCase):
             self.addCleanup(patcher.stop)
         written = fb._spawn_elevated_write(
             self.request, self.status, self.result,
-            lambda *a: progress.append(a), status.append, log.append,
+            lambda *a: progress.append(a), status.append,
+            log if callable(log) else log.append,
             cancel or threading.Event(), cancel_path=cancel_path)
         return written, progress, status, log
 
@@ -331,16 +334,24 @@ class SpawnElevatedWriteTests(unittest.TestCase):
         self.assertTrue(os.path.exists(cancel_path))
         self.assertEqual(kernel.terminated, [])
 
-    def test_unresponsive_helper_is_terminated_after_grace(self):
+    def test_slow_helper_is_never_terminated(self):
+        # Killing the helper would leave Windows automount disabled; the GUI
+        # must keep waiting until the helper unwinds and restores it.
         kernel = FakeKernel32()
-        kernel.WaitForSingleObject = lambda _h, _ms: 0x102  # WAIT_TIMEOUT
+        polls = iter([0x102] * 5 + [0])    # WAIT_TIMEOUT x5, then exited
+        kernel.WaitForSingleObject = lambda _h, _ms: next(polls)
         cancel = threading.Event()
         cancel.set()
+        logs = []
+        with open(self.result, "w", encoding="utf-8") as handle:
+            json.dump({"ok": False, "cancelled": True}, handle)
         with mock.patch.object(fb, "HELPER_CANCEL_GRACE_S", 0.0):
             with self.assertRaises(fb.Cancelled):
                 self._run(FakeShell32(), kernel, cancel=cancel,
-                          cancel_path=os.path.join(self._tmp.name, "cancel"))
-        self.assertEqual(kernel.terminated, [4242])
+                          cancel_path=os.path.join(self._tmp.name, "cancel"),
+                          log=logs.append)
+        self.assertEqual(kernel.terminated, [])
+        self.assertTrue(any("Still waiting" in line for line in logs))
 
     def test_helper_watches_cancel_file(self):
         cancel_path = os.path.join(self._tmp.name, "cancel")

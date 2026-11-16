@@ -305,10 +305,17 @@ class FakeVolumeKernel32:
                 return 1
             return 0
 
+        self.opened = []
+
         def create_file(name, access, share, sec, disp, flags, tmpl):
             self._next += 1
             handle = self._next
-            disk = next((d for n, d in self.volumes if n == name), None)
+            self.opened.append(name)
+            # Real CreateFileW wants the volume GUID path *without* the
+            # trailing backslash FindFirstVolumeW returns (with it, the root
+            # directory is opened instead of the volume device).
+            disk = next((d for n, d in self.volumes
+                         if n.rstrip("\\") == name), None)
             self.by_handle[handle] = (name, disk)
             return handle
 
@@ -371,6 +378,10 @@ class VolumeLockTests(unittest.TestCase):
         self.assertEqual(sorted(k.locked), sorted(held))
         self.assertEqual(sorted(k.dismounted), sorted(held))
 
+        self.assertTrue(k.opened)
+        for name in k.opened:
+            self.assertFalse(name.endswith("\\"), name)
+
         other = next(h for h, (n, d) in k.by_handle.items() if d == 0)
         self.assertIn(other, k.closed)      # opened, then closed untouched
         self.assertNotIn(other, k.locked)
@@ -385,8 +396,11 @@ class VolumeLockTests(unittest.TestCase):
 
     def test_lock_failure_is_skipped(self):
         k = FakeVolumeKernel32([("\\\\?\\Volume{aaa}\\", 5)], lock_ok=False)
-        held = fb._lock_and_dismount_volumes(k, 5, lambda _m: None)
+        failed = []
+        held = fb._lock_and_dismount_volumes(k, 5, lambda _m: None,
+                                             failed=failed)
         self.assertEqual(held, [])
+        self.assertEqual(failed, ["\\\\?\\Volume{aaa}\\"])
         self.assertEqual(k.locked, [])
         self.assertTrue(k.closed)           # un-lockable handle was released
 

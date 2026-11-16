@@ -35,6 +35,7 @@ import json
 import os
 import plistlib
 import queue
+import re
 import shutil
 import struct
 import subprocess
@@ -741,41 +742,142 @@ def list_devices() -> list[dict]:
     return _list_devices_linux()
 
 
+def revalidate_device(device: dict) -> dict:
+    """
+    Re-enumerate drives and confirm `device` is still the same disk.
+
+    Guards against a card being swapped (and its node reused) between picking
+    it and wiping it. Returns the fresh entry; raises FlasherError otherwise.
+    """
+    try:
+        current = list_devices()
+    except Exception as exc:
+        raise FlasherError(f"Could not re-check the drives: {exc}") from exc
+    fresh = next((d for d in current if d["path"] == device["path"]), None)
+    if fresh is None:
+        raise FlasherError(
+            f"{device['path']} is no longer connected. Re-insert the card, "
+            "press Refresh and select it again. Nothing was written."
+        )
+    same = (fresh["size"] == device["size"]
+            and fresh.get("detail", "") == device.get("detail", "")
+            and fresh.get("index") == device.get("index"))
+    if not same:
+        raise FlasherError(
+            f"The drive at {device['path']} has changed since it was selected "
+            f"(now: {fresh['label']}). Press Refresh and select the card "
+            "again. Nothing was written."
+        )
+    if fresh["protected"]:
+        raise FlasherError(
+            f"{device['path']} now holds the system or mounted volumes and is "
+            "protected. Nothing was written."
+        )
+    return fresh
+
+
+def check_image_fits(image_size: int, device: dict) -> None:
+    """Refuse before wiping when the image is known not to fit the drive."""
+    if image_size and device.get("size") and image_size > device["size"]:
+        raise FlasherError(
+            f"The image needs {format_bytes(image_size)} but "
+            f"{device['path']} holds only {format_bytes(device['size'])}. "
+            "Use a larger card. Nothing was written."
+        )
+
+
 # -- Linux ------------------------------------------------------------------
-def _linux_root_disk() -> str | None:
-    """Best-effort identification of the disk backing '/'."""
-    for cmd in (
-        ["findmnt", "-no", "SOURCE", "/"],
-        ["sh", "-c", "grep -E ' / ' /proc/mounts | head -n1 | cut -d' ' -f1"],
-    ):
+SYS_CLASS_BLOCK = "/sys/class/block"
+# udisks/desktop automounts live here; a card mounted there is unmounted and
+# flashed. A disk with a mount anywhere else (/, /home, /mnt/data, swap ...)
+# is treated as part of this computer and protected.
+REMOVABLE_MOUNT_ROOTS = ("/media/", "/run/media/")
+
+
+def _unescape_mount_field(field: str) -> str:
+    """/proc/mounts and /proc/swaps octal-escape spaces etc. (\\040)."""
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), field)
+
+
+def _linux_disks_of(node: str, _depth: int = 0) -> set[str]:
+    """
+    Whole-disk names (e.g. {"nvme0n1"}) backing a block device node.
+
+    Resolves partitions to their disk and walks device-mapper/MD "slaves"
+    (LUKS, LVM, RAID) down to every physical disk underneath.
+    """
+    # findmnt prints btrfs subvolumes as "/dev/sda2[/@]".
+    node = re.sub(r"\[.*\]$", "", node.strip())
+    if not node.startswith("/dev/") or _depth > 8:
+        return set()
+    name = os.path.basename(os.path.realpath(node))
+    sys_dir = os.path.join(SYS_CLASS_BLOCK, name)
+    if not os.path.exists(sys_dir):
+        return set()
+    try:
+        slaves = os.listdir(os.path.join(sys_dir, "slaves"))
+    except OSError:
+        slaves = []
+    if slaves:
+        disks: set[str] = set()
+        for slave in slaves:
+            disks |= _linux_disks_of("/dev/" + slave, _depth + 1)
+        return disks
+    if os.path.exists(os.path.join(sys_dir, "partition")):
+        return {os.path.basename(os.path.dirname(os.path.realpath(sys_dir)))}
+    return {name}
+
+
+def _linux_mounts() -> list[tuple[str, str]]:
+    """(source device, mountpoint) for every /dev-backed mount and swap."""
+    entries: list[tuple[str, str]] = []
+    try:
+        with open("/proc/mounts", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                fields = line.split()
+                if len(fields) >= 2 and fields[0].startswith("/dev/"):
+                    entries.append((_unescape_mount_field(fields[0]),
+                                    _unescape_mount_field(fields[1])))
+    except OSError:
+        pass
+    try:
+        with open("/proc/swaps", encoding="utf-8", errors="replace") as fh:
+            for line in fh.readlines()[1:]:
+                fields = line.split()
+                if fields and fields[0].startswith("/dev/"):
+                    entries.append((_unescape_mount_field(fields[0]), "[SWAP]"))
+    except OSError:
+        pass
+    return entries
+
+
+def _linux_root_disks() -> set[str]:
+    """Every physical disk backing '/' (several for LVM/RAID spanning disks)."""
+    disks: set[str] = set()
+    for cmd in (["findmnt", "-no", "SOURCE", "/"],):
         try:
             out = subprocess.check_output(cmd, text=True, stderr=DEVNULL).strip()
         except Exception:
             continue
-        if not out.startswith("/dev/"):
-            continue
-        node = out.split(" ")[0]
-        base = os.path.realpath(node)
-        # Strip a partition suffix: sda2 -> sda, nvme0n1p2 -> nvme0n1, mmcblk0p1 -> mmcblk0
-        name = os.path.basename(base)
-        try:
-            sysname = subprocess.check_output(
-                ["lsblk", "-no", "PKNAME", base], text=True, stderr=DEVNULL
-            ).strip().splitlines()
-            if sysname and sysname[0]:
-                return sysname[0]
-        except Exception:
-            pass
-        stripped = name
-        if "nvme" in name or "mmcblk" in name:
-            stripped = name.split("p")[0]
-        return stripped
-    return None
+        disks |= _linux_disks_of(out.split(" ")[0])
+    for source, point in _linux_mounts():
+        if point == "/":
+            disks |= _linux_disks_of(source)
+    return disks
+
+
+def _linux_protected_disks() -> set[str]:
+    """Disks that hold the OS or any mount outside the automount folders."""
+    protected = _linux_root_disks()
+    for source, point in _linux_mounts():
+        if point == "[SWAP]" or not point.startswith(REMOVABLE_MOUNT_ROOTS):
+            protected |= _linux_disks_of(source)
+    return protected
 
 
 def _list_devices_linux() -> list[dict]:
     devices: list[dict] = []
-    root_disk = _linux_root_disk()
+    system_disks = _linux_protected_disks()
 
     # Preferred path: lsblk gives us model names and mountpoints in one shot.
     try:
@@ -798,9 +900,7 @@ def _list_devices_linux() -> list[dict]:
             model = (block.get("model") or "").strip()
             tran = (block.get("tran") or "").strip().upper()
             removable = block.get("rm") is True or block.get("rm") == "1"
-            mounts = block.get("mountpoints") or []
-            has_mount = any(mounts)
-            protected = (name == root_disk) or has_mount
+            protected = name in system_disks
 
             label = f"/dev/{name}"
             if size:
@@ -850,7 +950,7 @@ def _list_devices_linux() -> list[dict]:
                     model = fh.read().strip()
             except Exception:
                 pass
-            protected = name == root_disk
+            protected = name in system_disks
 
             label = f"/dev/{name}"
             if size:
@@ -1048,20 +1148,27 @@ def wipe_device(device: dict, log) -> None:
 def _wipe_linux(device: dict, log) -> None:
     path = device["path"]
     log(f"Unmounting any volumes on {path} ...")
-    # Any mounted partition must be released before we clobber the disk.
-    try:
-        mounts = subprocess.check_output(["lsblk", "-no", "MOUNTPOINT", path],
-                                         text=True, stderr=DEVNULL)
-    except Exception:
-        mounts = ""
-    for point in (m.strip() for m in mounts.splitlines()):
-        if not point:
-            continue
-        log(f"  unmounting {point}")
+    # Every mount and swap on the card must be released before we clobber it;
+    # writing under a live filesystem corrupts the result, so fail closed.
+    disk = os.path.basename(os.path.realpath(path))
+    busy = [(src, point) for src, point in _linux_mounts()
+            if disk in _linux_disks_of(src)]
+    # Deepest mountpoints first so nested mounts come off before parents.
+    for src, point in sorted(busy, key=lambda e: e[1].count("/"), reverse=True):
+        if point == "[SWAP]":
+            log(f"  swapoff {src}")
+            cmd = ["swapoff", src]
+        else:
+            log(f"  unmounting {point}")
+            cmd = ["umount", point]
         try:
-            _run(["umount", point], stdout=DEVNULL, stderr=DEVNULL)
+            _run(cmd, stdout=DEVNULL, stderr=subprocess.PIPE)
         except FlasherError as exc:
-            log(f"  could not unmount {point}: {exc}")
+            raise FlasherError(
+                f"Could not release {point} on {path}:\n{exc}\n\n"
+                "Close any file manager windows or programs using the card, "
+                "then try again. The card was NOT modified."
+            ) from exc
 
     log(f"Wiping filesystem signatures on {path} (wipefs) ...")
     try:
@@ -1327,7 +1434,15 @@ def _flash_posix(image_path, device, total, progress, cancel, log) -> int:
         )
         if proc.stdin is not None:
             proc.stdin.close()
-        proc.wait(timeout=600)
+        # conv=fsync can take many minutes on a slow card; keep waiting but
+        # stay responsive to Cancel.
+        while True:
+            try:
+                proc.wait(timeout=1)
+                break
+            except subprocess.TimeoutExpired:
+                if cancel.is_set():
+                    raise Cancelled() from None
     except Cancelled:
         _kill(proc)
         raise
@@ -1388,13 +1503,15 @@ def _kill(proc: subprocess.Popen) -> None:
 # and force-dismounting every volume on the disk before we start, and keeping
 # those locks held until the write finishes, takes the file-system driver out
 # of the picture so the raw stream is never refused.
-def _lock_and_dismount_volumes(kernel32, disk_number: int, log, quiet: bool = False):
+def _lock_and_dismount_volumes(kernel32, disk_number: int, log,
+                               quiet: bool = False,
+                               failed: list | None = None):
     """
     Open every volume that lives on `disk_number`, lock + force-dismount it,
     and return the still-open volume handles (caller must release them).
 
-    Best-effort: a volume that refuses to lock (e.g. in use) is logged and
-    skipped, and the flash continues.
+    A volume that refuses both lock and dismount (e.g. in use) is logged,
+    skipped, and its name appended to `failed` when a list is given.
     """
     import ctypes
     from ctypes import wintypes
@@ -1452,8 +1569,10 @@ def _lock_and_dismount_volumes(kernel32, disk_number: int, log, quiet: bool = Fa
     try:
         while True:
             name = buffer.value
+            # FindFirstVolumeW names end in "\\"; with it, CreateFileW opens the
+            # volume's root directory instead of the volume device.
             volume = kernel32.CreateFileW(
-                name,
+                name.rstrip("\\"),
                 GENERIC_READ | GENERIC_WRITE,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 None,
@@ -1477,6 +1596,8 @@ def _lock_and_dismount_volumes(kernel32, disk_number: int, log, quiet: bool = Fa
                 if on_disk and _lock_volume(kernel32, volume, name, log):
                     locked.append(volume)   # keep the handle open (locked)
                 else:
+                    if on_disk and failed is not None:
+                        failed.append(name)
                     kernel32.CloseHandle(volume)
 
             if not kernel32.FindNextVolumeW(find, buffer, len(buffer)):
@@ -1606,9 +1727,19 @@ def _flash_windows(image_path, device, total, progress, cancel, log) -> int:
         if disk_number is None:
             log("  (physical drive number unknown; skipping volume lock)")
         else:
+            unlockable: list = []
             locked_volumes = _lock_and_dismount_volumes(
-                kernel32, disk_number, log,
+                kernel32, disk_number, log, failed=unlockable,
             )
+            if unlockable:
+                # Raw writes across a live volume are refused (or worse,
+                # raced by the file system); stop before writing anything.
+                raise FlasherError(
+                    "A volume on the card is in use and could not be locked:\n"
+                    + "\n".join(f"  {name}" for name in unlockable)
+                    + "\n\nClose any Explorer windows or programs using the "
+                    "card, then try again."
+                )
 
         zero = ctypes.c_longlong(0)
         kernel32.SetFilePointerEx(handle, zero, None, 0)
@@ -1703,6 +1834,8 @@ ERROR_CANCELLED = 1223  # UAC prompt dismissed
 # How long Cancel waits for the helper to stop by itself (restoring automount
 # and Shell Hardware Detection) before it is forcibly terminated.
 HELPER_CANCEL_GRACE_S = 20.0
+# How long closing the window waits for a cancelled flash to clean up.
+CLOSE_WAIT_S = 30.0
 
 
 def _request_cancel(cancel_path: str | None) -> None:
@@ -1905,6 +2038,37 @@ def _privileged_write_main(request_path: str) -> int:
         return finish(False, error=f"Unexpected error: {exc}")
 
 
+def _share_workdir_with_admins(path: str, log) -> None:
+    """
+    Make the hand-off folder usable by both sides of the UAC boundary.
+
+    Python 3.13+ creates mkdtemp() folders with an owner-only ACL. UAC may
+    elevate as a *different* admin account (over-the-shoulder credentials),
+    whose files the GUI user then cannot read back. Grant this user and the
+    Administrators group inheritable access so status/result files written
+    by the helper stay readable. Best-effort; same-account UAC needs none.
+    """
+    if not IS_WINDOWS:
+        return
+    grants = ["*S-1-5-32-544:(OI)(CI)F"]          # BUILTIN\\Administrators
+    try:
+        out = _hidden_run(["whoami", "/user", "/fo", "csv", "/nh"]).stdout
+        sid = out.strip().split(",")[-1].strip().strip('"')
+        if sid.startswith("S-1-"):
+            grants.append(f"*{sid}:(OI)(CI)F")
+    except Exception:
+        pass
+    cmd = ["icacls", path]
+    for grant in grants:
+        cmd += ["/grant", grant]
+    cmd += ["/T", "/Q"]
+    try:
+        if _hidden_run(cmd).returncode != 0:
+            log("  (could not adjust temp folder permissions)")
+    except Exception as exc:
+        log(f"  (could not adjust temp folder permissions: {exc})")
+
+
 def _spawn_elevated_write(request_path: str, status_path: str,
                           result_path: str, progress, status_cb, log,
                           cancel: threading.Event,
@@ -1984,16 +2148,21 @@ def _spawn_elevated_write(request_path: str, status_path: str,
     try:
         while True:
             if cancel.is_set() and cancel_deadline is None:
-                # Ask the helper to stop cleanly so it restores automount and
-                # Shell Hardware Detection; only kill it if it does not comply.
+                if not cancel_path:
+                    # No channel to ask it to stop; killing is all we have.
+                    if not kernel32.TerminateProcess(process, 1):
+                        log("  (could not terminate the elevated helper; it "
+                            "will stop on its own)")
+                    raise Cancelled()
+                # Ask the helper to stop cleanly. It is never killed: only it
+                # can restore automount and Shell Hardware Detection (killing
+                # it would leave Windows with automount off, persistently).
                 _request_cancel(cancel_path)
-                cancel_deadline = time.monotonic() + (
-                    HELPER_CANCEL_GRACE_S if cancel_path else 0.0)
+                cancel_deadline = time.monotonic() + HELPER_CANCEL_GRACE_S
             if cancel_deadline is not None and time.monotonic() >= cancel_deadline:
-                if not kernel32.TerminateProcess(process, 1):
-                    log("  (could not terminate the elevated helper; it will "
-                        "stop on its own)")
-                raise Cancelled()
+                log("  Still waiting for the elevated helper to finish its "
+                    "current write and restore Windows settings ...")
+                cancel_deadline = float("inf")
             offset = _read_status_updates(
                 status_path, offset,
                 lambda event: _dispatch_worker_event(
@@ -2119,6 +2288,14 @@ class FlashWorker(threading.Thread):
                          "shown as an estimate.")
                 total = 0
 
+            # The download can take minutes: make sure the selected card is
+            # still the one plugged in, and that the image fits on it.
+            self.log("Re-checking the target drive ...")
+            self.device = revalidate_device(self.device)
+            check_image_fits(total, self.device)
+            if self.cancel_event.is_set():
+                raise Cancelled()
+
             if IS_WINDOWS and not is_elevated():
                 written, elapsed = self._flash_elevated(image_path, total)
             else:
@@ -2204,6 +2381,7 @@ class FlashWorker(threading.Thread):
         }
         with open(request_path, "w", encoding="utf-8") as handle:
             json.dump(request, handle)
+        _share_workdir_with_admins(self._workdir, self.log)
 
         self.status("Waiting for administrator approval ...")
         self.log("Administrator rights are not held; requesting elevation for "
@@ -2730,9 +2908,11 @@ class BananaFlasherApp(tk.Tk):
         from tkinter import messagebox
 
         size = format_bytes(device["size"]) if device["size"] else "unknown size"
-        checksum_line = ""
         if release.get("checksum"):
             checksum_line = f"\nSHA-256: {release['checksum'][:16]}… (will be verified)\n"
+        else:
+            checksum_line = ("\n⚠ This release publishes no checksum, so the "
+                             "download cannot be verified.\n")
         repo = release.get("repo") or repo_for_model(model)
         message = (
             f"You are about to ERASE and overwrite:\n\n"
@@ -2978,11 +3158,33 @@ class BananaFlasherApp(tk.Tk):
             ):
                 return
             self.worker.cancel()
+            if not silent:
+                # The worker is a daemon thread: destroying now would kill it
+                # before its cleanup (temp image, dd, Windows automount) runs.
+                self.status_var.set("Cancelling — cleaning up before exit ...")
+                self.withdraw()
+                self._finish_close(time.monotonic() + CLOSE_WAIT_S)
+                return
 
         self._closing = True
         self.privileges.shutdown()
         if not silent:
             self.destroy()
+
+    def _finish_close(self, deadline: float) -> None:
+        """Poll until the cancelled worker has unwound (or time runs out)."""
+        worker = self.worker
+        if worker and worker.is_alive() and time.monotonic() < deadline:
+            self.after(100, self._finish_close, deadline)
+            return
+        if worker and worker.is_alive():
+            # Gave up waiting: at least drop the multi-GB download.
+            workdir = getattr(worker, "_workdir", None)
+            if workdir and not worker.keep_image:
+                shutil.rmtree(workdir, ignore_errors=True)
+        self._closing = True
+        self.privileges.shutdown()
+        self.destroy()
 
 
 # ===========================================================================
