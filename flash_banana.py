@@ -37,6 +37,7 @@ import plistlib
 import queue
 import re
 import shutil
+import ssl
 import struct
 import subprocess
 import sys
@@ -93,7 +94,7 @@ def _hidden_run(cmd: list[str], timeout: int = 60, encoding: str = "utf-8",
 #  Application / release constants
 # ---------------------------------------------------------------------------
 APP_NAME = "BananaLinux Flasher"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.0.1"
 
 DEFAULT_REPO = "JorreFog/BananaLinux"
 GITHUB_REPO = DEFAULT_REPO
@@ -463,6 +464,47 @@ class Privileges:
 # ===========================================================================
 #  Networking -- GitHub release lookup + streaming download
 # ===========================================================================
+# CA bundle locations used by the major distro families. A frozen build
+# (PyInstaller AppImage) carries the OpenSSL from the CI host (Ubuntu), whose
+# compiled-in OPENSSLDIR is /usr/lib/ssl -- that path does not exist on Arch,
+# Fedora, openSUSE, etc., so the default context ends up with zero trusted CAs
+# and every HTTPS request fails with CERTIFICATE_VERIFY_FAILED.
+_LINUX_CA_BUNDLES = (
+    "/etc/ssl/certs/ca-certificates.crt",  # Debian/Ubuntu/Arch/Gentoo
+    "/etc/pki/tls/certs/ca-bundle.crt",  # Fedora/RHEL
+    "/etc/ssl/ca-bundle.pem",  # openSUSE
+    "/etc/pki/tls/cacert.pem",  # OpenELEC
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",  # CentOS/RHEL 7+
+    "/etc/ssl/cert.pem",  # Alpine, Arch symlink
+)
+
+_ssl_context: "ssl.SSLContext | None" = None
+
+
+def _build_ssl_context() -> ssl.SSLContext:
+    """Default TLS context, plus a host CA bundle if OpenSSL found none."""
+    ctx = ssl.create_default_context()
+    if sys.platform.startswith("linux") and not (
+        os.environ.get("SSL_CERT_FILE") or os.environ.get("SSL_CERT_DIR")
+    ):
+        if ctx.cert_store_stats().get("x509_ca", 0) == 0:
+            for path in _LINUX_CA_BUNDLES:
+                if os.path.isfile(path):
+                    try:
+                        ctx.load_verify_locations(cafile=path)
+                    except (OSError, ssl.SSLError):
+                        continue
+                    break
+    return ctx
+
+
+def _get_ssl_context() -> ssl.SSLContext:
+    global _ssl_context
+    if _ssl_context is None:
+        _ssl_context = _build_ssl_context()
+    return _ssl_context
+
+
 def _open_url(url: str, timeout: int = 30):
     request = urllib.request.Request(
         url,
@@ -471,7 +513,9 @@ def _open_url(url: str, timeout: int = 30):
             "Accept": "application/vnd.github+json",
         },
     )
-    return urllib.request.urlopen(request, timeout=timeout)
+    return urllib.request.urlopen(
+        request, timeout=timeout, context=_get_ssl_context()
+    )
 
 
 def _fetch_json(url: str) -> object:
